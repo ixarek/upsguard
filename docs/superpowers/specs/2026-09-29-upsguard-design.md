@@ -30,6 +30,13 @@
 - `sudo rtcwake -m off -s 120`: ПК выключился и сам включился через 2 минуты. RTC-пробуждение работает.
 - В `lsusb` есть `ATEN Virtual mouse/keyboard device` и `ATEN Hub`: похоже на BMC с iKVM. Монитора сейчас нет.
 
+### Проверено по самим пакетам NUT (скачаны в `debs/`, 2026-09-29)
+
+- `nut-server` жёстко зависит от `nut-client` той же версии, поэтому `upsmon` и `nut-monitor.service` ставятся всегда.
+- `usbhid-ups` в этой сборке содержит подпрограмму `Delta UPS HID 0.6`, udev-правила знают `05dd:041b` (`GROUP="nut"`).
+- Юниты: `nut-driver@.service` (шаблонный, экземпляры создаёт `nut-driver-enumerator` по секциям `ups.conf`), `nut-server.service`, `nut-monitor.service`, `nut.target`.
+- Хук выключения `nutshutdown` вызывает `upsdrvctl shutdown` только если `upsmon -K` находит флаг `POWERDOWNFLAG`. Без флага выход ИБП не отключается.
+
 ### Установлено по документации и исходникам (на железе не проверено)
 
 - NUT поддерживает Delta RT и Amplon R 1/2/3 кВА драйвером `usbhid-ups` с подпрограммой `delta_ups-hid` (VID `05dd`, PID `041b`). DDL-дамп UPS302R2000B0BA снят на NUT 2.7.4. В нём есть `ups.status`, `battery.charge`, `battery.runtime`, `ups.load`, `ups.realpower`, `battery.charge.low` (rw), `ups.delay.start`, `ups.start.auto`.
@@ -40,7 +47,7 @@
 ### Не проверено (выясняется в фазе 0)
 
 - Реальные значения `ups.status`, `battery.charge`, `battery.runtime`, `ups.load` на этом ИБП.
-- Имена юнитов NUT 2.8 (в 2.8 драйвер запускается шаблонным `nut-driver@<имя>.service`) и поведение `upsd` без `upsd.users`.
+- Что стартует само после установки пакетов, как `nut-driver-enumerator` создаёт экземпляр `nut-driver@ups.service` после записи `ups.conf`, и поведение `upsd` с пустым `upsd.users`.
 - «Battery Save» на GAIA.
 - Второй ПК: Wake-on-LAN (BIOS, `ethtool`), одна ли L2-сеть с сервером, доступность порта 3493.
 - Влияние режимов защиты Astra и файрвола на связь клиента с `upsd`.
@@ -53,7 +60,7 @@
                                        только чтение
 ```
 
-- **NUT только читает ИБП:** на мастере работают `usbhid-ups` и `upsd`. Юнит `upsmon` (в Debian `nut-monitor.service`) маскируется, флага `POWERDOWNFLAG` (по умолчанию `/etc/killpower`) быть не должно. Поэтому NUT никогда не отключит выход ИБП.
+- **NUT только читает ИБП:** на мастере работают `usbhid-ups` и `upsd`. Юнит `upsmon` (`nut-monitor.service`) приезжает вместе с `nut-client` и маскируется. Флага `POWERDOWNFLAG` (по умолчанию `/etc/killpower`) быть не должно: хук `nutshutdown` отправляет `upsdrvctl shutdown` только при его наличии. Поэтому NUT никогда не отключит выход ИБП.
 - **`upsguard` единственный «выключатель» на каждом узле.** Демон под systemd от root (без `User=`), Python 3.7+, только stdlib. С `upsd` говорит по текстовому протоколу и **только читает**. Команд в ИБП не шлёт. Страховочный `upsmon` по Low Battery и штатные «slave» NUT сознательно не используются: они отрубили бы весь выход ИБП вместе с сетью.
 - Все внешние вызовы (сокет, `subprocess`) идут с таймаутами. Остановка по SIGTERM через `threading.Event`: под systemd stdin не терминал, `input()` использовать нельзя (урок upsmonitor).
 
@@ -221,16 +228,16 @@ methods = log, wall
 
 ## 9. Упаковка и развёртывание (офлайн)
 
-Бандл (по образцу upsmonitor): `debs/` (только для мастера: NUT 2.8.1 и недостающие зависимости), `upsguard/` (код), `conf/` (шаблоны `nut.conf`, `ups.conf`, `upsd.conf`, `upsguard.ini`), `upsguard.service`, `install.sh`, `uninstall.sh`, `tools/wol.py` (проверка WoL в фазе 0, затем модуль `wake`).
+Бандл (по образцу upsmonitor): `debs/` (только для мастера: 10 пакетов `nut-server`, `nut-client`, `libupsclient6`, `libnutscan2`, `libnss3`, `libnspr4`, `libltdl7`, `libnsl2`, `libusb-1.0-0`, `libwrap0`; замыкание зависимостей без базовых пакетов Astra, `MANIFEST.tsv` и `SHA256SUMS` рядом), `upsguard/` (код), `conf/` (шаблоны `nut.conf`, `ups.conf`, `upsd.conf`, `upsguard.ini`), `upsguard.service`, `install.sh`, `uninstall.sh`, `tools/wol.py` (проверка WoL в фазе 0, затем модуль `wake`).
 
 `install.sh --role master --listen-ip <IP> --allow <IP клиента>` идемпотентный:
 
-1. `dpkg -i debs/*.deb`.
+1. Проверяет `SHA256SUMS` и ставит пакеты из `debs/` командой `apt-get install --no-download --no-install-recommends ./debs/*.deb`. Уже установленные пакеты не трогаются, а понижение версии `apt` не делает без явного разрешения (при появлении в плане `DOWNGRADED` установка останавливается).
 2. Пишет `nut.conf` (`MODE=standalone`), `ups.conf` (`driver = usbhid-ups`, `port = auto`, `vendorid = 05dd`, `productid = 041b`), `upsd.conf` (`LISTEN 127.0.0.1 3493`, а при `--listen-ip` ещё `LISTEN <IP> 3493`; без ключа по сети не слушаем), пустой `upsd.users`.
 3. Маскирует `nut-monitor.service` и удаляет флаг `POWERDOWNFLAG`, если он есть.
 4. Закрывает порт 3493 файрволом до адресов из `--allow`.
 5. Копирует код в `/opt/upsguard`, конфиг в `/etc/upsguard`, ставит `upsguard.service`.
-6. Включает и запускает юниты NUT (имена сверяются после установки) и `upsguard`.
+6. Включает и запускает `nut-driver.target` и `nut-server.service` (экземпляр `nut-driver@ups.service` создаёт `nut-driver-enumerator` после записи `ups.conf`) и `upsguard`. Порядок запуска сверяется на месте в фазе 0.
 
 `install.sh --role client --master <IP мастера>`: копирует код, пишет `upsguard.ini` с `[nut] host`, ставит и запускает `upsguard.service`. `.deb` не нужны.
 
@@ -259,7 +266,7 @@ methods = log, wall
 
 **Фаза 0 (без нашего кода, делает пользователь).** Уже сделано на `sikn-531`: `lsusb`, `apt-cache policy`, `rtcwake`. Осталось:
 
-1. Собрать офлайн-`.deb` для NUT 2.8.1 (`nut-server`, `nut-client` и недостающие зависимости), поставить на `sikn-531`. Настроить `ups.conf` (`driver = usbhid-ups`, `port = auto`, `vendorid = 05dd`, `productid = 041b`), снять `upsc ups`: `ups.status`, `battery.charge`, `battery.runtime`, `ups.load`, `ups.realpower`, `battery.charge.low`. Только чтение, `upsmon` не запускать.
+1. Поставить на `sikn-531` офлайн-пакеты NUT 2.8.1 из `debs/` (10 `.deb`, скачаны и сверены с индексом репозитория 2026-09-29). Настроить `ups.conf` (`driver = usbhid-ups`, `port = auto`, `vendorid = 05dd`, `productid = 041b`), снять `upsc ups`: `ups.status`, `battery.charge`, `battery.runtime`, `ups.load`, `ups.realpower`, `battery.charge.low`. Только чтение, `upsmon` не запускать.
 2. Записать реальные `ups.load`, `ups.realpower` и `battery.runtime` с включённым и выключенным сервером: по ним выбирается T.
 3. Понаблюдать «Battery Save»: нагрузка на ИБП только сетевое оборудование, сеть на входе ИБП отключена, ждать 35 минут (окно обслуживания).
 4. Когда второй ПК подключат: проверить WoL (BIOS, `ethtool`, `tools/wol.py` с `sikn-531`) и доступность порта 3493 с клиента.
