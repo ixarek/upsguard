@@ -1,0 +1,13 @@
+[Unit]
+Description=UPS Guard - standalone RTC power check (manual use)
+Wants=nut-server.service
+After=local-fs.target network.target nut-server.service
+RequiresMountsFor="@PROJECT_DIR@"
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 "@PROGRAM@" --config "@CONFIG@" boot-check
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
